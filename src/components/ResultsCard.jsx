@@ -2,7 +2,7 @@ import React from 'react';
 import { ClipboardCopy, Clock, AudioLines } from 'lucide-react';
 
 const ResultsCard = ({ data }) => {
-  const { transcription, processing_time, audio_duration, segments } = data;
+  const { transcription, processing_time, audio_duration, segments, segments_count } = data;
 
   const copyText = () => {
     navigator.clipboard.writeText(transcription);
@@ -32,9 +32,9 @@ const ResultsCard = ({ data }) => {
         <span className="inline-flex items-center gap-1 bg-gray-700 px-2 py-1 rounded-full">
           <Clock className="w-4 h-4" /> Processing: {processing_time?.toFixed?.(2) || processing_time}s
         </span>
-        {segments !== undefined && (
+        {(segments_count !== undefined || (Array.isArray(segments) && segments.length)) && (
           <span className="inline-flex items-center gap-1 bg-gray-700 px-2 py-1 rounded-full">
-            Segments: {segments}
+            Segments: {segments_count ?? segments.length}
           </span>
         )}
       </div>
