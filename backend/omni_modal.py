@@ -183,9 +183,32 @@ def download_model():
 
     logger.info("📥 Downloading Silero VAD...")
     torch.hub.set_dir(MODEL_DIR)
-    torch.hub.load(
-        repo_or_dir="snakers4/silero-vad", model="silero_vad", force_reload=True
-    )
+    
+    # Retry logic for GitHub rate limits
+    max_retries = 3
+    retry_delay = 60  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            torch.hub.load(
+                repo_or_dir="snakers4/silero-vad", 
+                model="silero_vad", 
+                force_reload=False,  # Don't force reload to use cache if available
+                trust_repo=True
+            )
+            logger.info("✅ Silero VAD downloaded successfully")
+            break
+        except Exception as e:
+            if "rate limit" in str(e).lower() and attempt < max_retries - 1:
+                logger.warning(f"⚠️ GitHub rate limit hit. Waiting {retry_delay}s before retry {attempt + 2}/{max_retries}...")
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            elif attempt == max_retries - 1:
+                logger.error(f"❌ Failed to download Silero VAD after {max_retries} attempts: {e}")
+                raise RuntimeError(f"Failed to download Silero VAD: {str(e)}")
+            else:
+                logger.error(f"❌ Error downloading Silero VAD: {e}")
+                raise
 
     logger.info("✅ All models cached successfully.")
 
@@ -193,7 +216,7 @@ def download_model():
 @app.cls(
     gpu="L4",
     scaledown_window=1800,
-    timeout=1200,
+    timeout=3600,  # 1 hour timeout for model downloads
     volumes={MODEL_DIR: model_cache},
     min_containers=0,  # Changed to 0 to reduce costs when idle
 )
@@ -213,13 +236,34 @@ class OmniASRModel:
         self.pipeline = ASRInferencePipeline(model_card=MODEL_CARD)
         self.supported_languages = supported_langs
 
-        # Load Silero VAD
+        # Load Silero VAD with retry logic
         logger.info("Loading Silero VAD...")
         torch.hub.set_dir(MODEL_DIR)
-        self.vad_model, utils = torch.hub.load(
-            repo_or_dir="snakers4/silero-vad", model="silero_vad", trust_repo=True
-        )
-        (self.get_speech_timestamps, _, self.read_audio, _, _) = utils
+        
+        max_retries = 3
+        retry_delay = 30
+        
+        for attempt in range(max_retries):
+            try:
+                self.vad_model, utils = torch.hub.load(
+                    repo_or_dir="snakers4/silero-vad", 
+                    model="silero_vad", 
+                    trust_repo=True,
+                    force_reload=False  # Use cache if available
+                )
+                (self.get_speech_timestamps, _, self.read_audio, _, _) = utils
+                logger.info("✅ Silero VAD loaded successfully")
+                break
+            except Exception as e:
+                if "rate limit" in str(e).lower() and attempt < max_retries - 1:
+                    logger.warning(f"⚠️ GitHub rate limit hit. Retrying in {retry_delay}s... (attempt {attempt + 2}/{max_retries})")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                elif attempt == max_retries - 1:
+                    logger.error(f"❌ Failed to load Silero VAD after {max_retries} attempts")
+                    raise RuntimeError(f"Failed to load Silero VAD: {str(e)}")
+                else:
+                    raise
 
         self.model_loaded = True
         logger.info("✅ Models ready!")
