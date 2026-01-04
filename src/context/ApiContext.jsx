@@ -22,7 +22,7 @@ export const ApiProvider = ({ children }) => {
   const instance = React.useMemo(() => {
     const axiosInstance = axios.create({ 
       baseURL: baseUrl,
-      timeout: 300000, // 5 minutes timeout for large files
+      timeout: 600000, // 10 minutes timeout for large files and cold starts
     });
 
     // Add request interceptor for API key

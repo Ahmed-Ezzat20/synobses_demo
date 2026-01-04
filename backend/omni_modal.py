@@ -218,7 +218,7 @@ def download_model():
     scaledown_window=1800,
     timeout=3600,  # 1 hour timeout for model downloads
     volumes={MODEL_DIR: model_cache},
-    min_containers=0,  # Changed to 0 to reduce costs when idle
+    min_containers=0,  # Set to 1 to keep warm and avoid cold starts (increases cost)
 )
 @modal.concurrent(max_inputs=10, target_inputs=8)
 class OmniASRModel:
@@ -704,7 +704,10 @@ async def transcribe_large_file(
         raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
 
 
-@app.function()
+@app.function(
+    timeout=3600,  # 1 hour timeout for long-running requests (cold starts)
+    container_idle_timeout=600,  # Keep container alive for 10 minutes
+)
 @modal.asgi_app()
 def fastapi_app():
     return web_app
