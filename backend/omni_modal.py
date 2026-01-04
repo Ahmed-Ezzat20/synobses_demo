@@ -306,6 +306,16 @@ class OmniASRModel:
             try:
                 duration = librosa.get_duration(path=tmp_path)
                 logger.info(f"[{request_id}] Audio duration: {duration:.2f}s")
+                
+                # Check if audio is too long for standard mode
+                if duration > 40:
+                    logger.warning(f"[{request_id}] Audio duration ({duration:.2f}s) exceeds 40s limit for standard mode")
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Audio duration ({duration:.2f}s) exceeds the 40-second limit for Standard Mode. Please use Large File Mode for audio longer than 40 seconds."
+                    )
+            except HTTPException:
+                raise  # Re-raise HTTPException as-is
             except Exception as e:
                 logger.error(f"[{request_id}] Error getting duration: {e}")
                 raise HTTPException(
@@ -706,7 +716,7 @@ async def transcribe_large_file(
 
 @app.function(
     timeout=3600,  # 1 hour timeout for long-running requests (cold starts)
-    container_idle_timeout=600,  # Keep container alive for 10 minutes
+    scaledown_window=600,  # Keep container alive for 10 minutes after last request
 )
 @modal.asgi_app()
 def fastapi_app():

@@ -14,11 +14,48 @@ const App = () => {
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [audioDuration, setAudioDuration] = useState(null);
+
+  // Detect audio duration when file changes
+  React.useEffect(() => {
+    if (!file) {
+      setAudioDuration(null);
+      return;
+    }
+
+    const audio = document.createElement('audio');
+    const objectUrl = URL.createObjectURL(file);
+    
+    audio.addEventListener('loadedmetadata', () => {
+      const duration = audio.duration;
+      setAudioDuration(duration);
+      
+      // Auto-switch to Large File Mode if duration > 40s
+      if (duration > 40 && !largeMode) {
+        setLargeMode(true);
+        setError(`Audio duration is ${duration.toFixed(1)}s. Automatically switched to Large File Mode (required for audio >40s).`);
+      }
+      
+      URL.revokeObjectURL(objectUrl);
+    });
+    
+    audio.addEventListener('error', () => {
+      URL.revokeObjectURL(objectUrl);
+    });
+    
+    audio.src = objectUrl;
+  }, [file, largeMode]);
 
   const handleTranscribe = async () => {
     setError('');
     if (!file || !language) {
       setError('Please select language and file.');
+      return;
+    }
+    
+    // Validate mode selection based on audio duration
+    if (audioDuration && audioDuration > 40 && !largeMode) {
+      setError(`Audio duration is ${audioDuration.toFixed(1)}s. Please use Large File Mode for audio longer than 40 seconds.`);
       return;
     }
     try {
@@ -52,7 +89,15 @@ const App = () => {
             >
               {loading ? 'Processing...' : 'Transcribe'}
             </button>
-            {error && <p className="text-red-400">{error}</p>}
+            {error && (
+              <div className={`p-4 rounded ${
+                error.includes('Automatically switched') || error.includes('Please use Large File Mode') 
+                  ? 'bg-yellow-900/30 border border-yellow-600 text-yellow-400' 
+                  : 'bg-red-900/30 border border-red-600 text-red-400'
+              }`}>
+                <p className="text-sm">{error}</p>
+              </div>
+            )}
             {result && <ResultsCard data={result} />}
           </>
         )}
