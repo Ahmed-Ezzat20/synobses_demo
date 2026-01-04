@@ -1,6 +1,10 @@
 import modal
 import os
 import time
+
+# Configure fairseq2 to use Modal's persistent volume for caching
+# This prevents re-downloading the 29.1GB model on every container restart
+os.environ["FAIRSEQ2_CACHE_DIR"] = "/model/fairseq2_cache"
 import tempfile
 import json
 import hashlib
