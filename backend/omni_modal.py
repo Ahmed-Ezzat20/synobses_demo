@@ -489,10 +489,13 @@ web_app.state.limiter = limiter
 web_app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS configuration
+# If ALLOWED_ORIGINS is ["*"], we need to set allow_credentials=False
+# because browsers don't allow credentials with wildcard origins
+allow_all_origins = ALLOWED_ORIGINS == ["*"]
 web_app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
+    allow_credentials=not allow_all_origins,  # Can't use credentials with "*"
     allow_methods=["*"],
     allow_headers=["*"],
 )
