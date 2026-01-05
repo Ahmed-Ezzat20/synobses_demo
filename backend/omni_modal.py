@@ -404,6 +404,8 @@ class OmniASRModel:
                 logger.warning(f"[{request_id}] No speech detected, processing entire audio")
                 # Process the entire audio without VAD chunking
                 # Skip the duration check since we're in large file mode
+                import librosa
+                
                 with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as tmp:
                     tmp.write(audio_bytes)
                     tmp_path = tmp.name
