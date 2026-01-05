@@ -22,7 +22,7 @@ export const ApiProvider = ({ children }) => {
   const instance = React.useMemo(() => {
     const axiosInstance = axios.create({ 
       baseURL: baseUrl,
-      timeout: 600000, // 10 minutes timeout for large files and cold starts
+      timeout: 1800000, // 30 minutes timeout for large files and cold starts (increased from 10 min)
     });
 
     // Add request interceptor for API key
@@ -153,7 +153,7 @@ export const ApiProvider = ({ children }) => {
     setError('');
   }, []);
 
-  const transcribe = async ({ file, language, large }) => {
+  const transcribe = async ({ file, language, large }, onProgress) => {
     if (!isConnected) {
       throw new Error('Not connected to API. Please connect first.');
     }
@@ -179,6 +179,15 @@ export const ApiProvider = ({ children }) => {
       onUploadProgress: (progressEvent) => {
         const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
         console.log(`Upload progress: ${percentCompleted}%`);
+        if (onProgress) {
+          onProgress({ stage: 'uploading', progress: percentCompleted });
+        }
+      },
+      onDownloadProgress: (progressEvent) => {
+        // Response is being received - transcription is complete
+        if (onProgress) {
+          onProgress({ stage: 'receiving', progress: 100 });
+        }
       },
     });
     
