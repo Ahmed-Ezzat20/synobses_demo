@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useCallback } from 'react';
+import React, { createContext, useContext, useState, useCallback, useRef } from 'react';
 import axios from 'axios';
 
 const ApiContext = createContext(null);
@@ -11,6 +11,10 @@ const ALLOWED_FILE_TYPES = [
   'video/mp4', 'video/webm', 'audio/m4a', 'audio/flac'
 ];
 
+// Polling configuration
+const POLL_INTERVAL = 3000; // Poll every 3 seconds
+const MAX_POLL_TIME = 30 * 60 * 1000; // Max 30 minutes of polling
+
 export const ApiProvider = ({ children }) => {
   const [baseUrl, setBaseUrl] = useState('');
   const [apiKey, setApiKey] = useState('');
@@ -18,11 +22,15 @@ export const ApiProvider = ({ children }) => {
   const [languages, setLanguages] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [currentJobId, setCurrentJobId] = useState(null);
+  
+  // Ref to track polling state
+  const pollingRef = useRef(null);
 
   const instance = React.useMemo(() => {
     const axiosInstance = axios.create({ 
       baseURL: baseUrl,
-      timeout: 1800000, // 30 minutes timeout for large files and cold starts (increased from 10 min)
+      timeout: 1800000, // 30 minutes timeout for large files and cold starts
     });
 
     // Add request interceptor for API key
@@ -146,6 +154,12 @@ export const ApiProvider = ({ children }) => {
   }, []);
 
   const disconnect = useCallback(() => {
+    // Cancel any ongoing polling
+    if (pollingRef.current) {
+      clearInterval(pollingRef.current);
+      pollingRef.current = null;
+    }
+    setCurrentJobId(null);
     setIsConnected(false);
     setBaseUrl('');
     setApiKey('');
@@ -153,7 +167,129 @@ export const ApiProvider = ({ children }) => {
     setError('');
   }, []);
 
-  const transcribe = async ({ file, language, large }, onProgress) => {
+  // Poll for job status
+  const pollJobStatus = async (jobId, onProgress) => {
+    try {
+      const { data } = await instance.get(`/jobs/${jobId}`, { timeout: 10000 });
+      
+      if (onProgress) {
+        onProgress({
+          stage: 'processing',
+          progress: data.progress || 0,
+          message: data.message,
+          status: data.status,
+        });
+      }
+      
+      return data;
+    } catch (err) {
+      console.error('Error polling job status:', err);
+      throw err;
+    }
+  };
+
+  // Submit async transcription job
+  const submitAsyncJob = async (file, language, onProgress) => {
+    const form = new FormData();
+    form.append('file', file);
+    
+    // Update progress - uploading
+    if (onProgress) {
+      onProgress({ stage: 'uploading', progress: 0 });
+    }
+    
+    const { data } = await instance.post('/transcribe_async', form, {
+      params: { language },
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 300000, // 5 minutes for upload
+      onUploadProgress: (progressEvent) => {
+        const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+        console.log(`Upload progress: ${percentCompleted}%`);
+        if (onProgress) {
+          onProgress({ stage: 'uploading', progress: percentCompleted });
+        }
+      },
+    });
+    
+    return data;
+  };
+
+  // Wait for job completion with polling
+  const waitForJobCompletion = (jobId, onProgress) => {
+    return new Promise((resolve, reject) => {
+      const startTime = Date.now();
+      setCurrentJobId(jobId);
+      
+      // Initial progress update
+      if (onProgress) {
+        onProgress({
+          stage: 'processing',
+          progress: 0,
+          message: 'Job submitted, waiting for processing...',
+          status: 'pending',
+        });
+      }
+      
+      const poll = async () => {
+        try {
+          // Check if we've exceeded max poll time
+          if (Date.now() - startTime > MAX_POLL_TIME) {
+            clearInterval(pollingRef.current);
+            pollingRef.current = null;
+            setCurrentJobId(null);
+            reject(new Error('Job timed out. Please try again or check the job status later.'));
+            return;
+          }
+          
+          const jobData = await pollJobStatus(jobId, onProgress);
+          
+          if (jobData.status === 'completed') {
+            clearInterval(pollingRef.current);
+            pollingRef.current = null;
+            setCurrentJobId(null);
+            
+            if (onProgress) {
+              onProgress({ stage: 'receiving', progress: 100 });
+            }
+            
+            resolve(jobData.result);
+          } else if (jobData.status === 'failed') {
+            clearInterval(pollingRef.current);
+            pollingRef.current = null;
+            setCurrentJobId(null);
+            reject(new Error(jobData.message || 'Transcription failed'));
+          }
+          // If pending or processing, continue polling
+        } catch (err) {
+          // Don't stop polling on temporary errors
+          console.error('Polling error:', err);
+          // Only reject if it's a 404 (job not found)
+          if (err.response?.status === 404) {
+            clearInterval(pollingRef.current);
+            pollingRef.current = null;
+            setCurrentJobId(null);
+            reject(new Error('Job not found. It may have expired.'));
+          }
+        }
+      };
+      
+      // Start polling
+      poll(); // Initial poll
+      pollingRef.current = setInterval(poll, POLL_INTERVAL);
+    });
+  };
+
+  // Cancel ongoing job/polling
+  const cancelJob = useCallback(() => {
+    if (pollingRef.current) {
+      clearInterval(pollingRef.current);
+      pollingRef.current = null;
+    }
+    setCurrentJobId(null);
+  }, []);
+
+  // Main transcribe function - automatically chooses sync vs async
+  const transcribe = async ({ file, language, large, useAsync = null }, onProgress) => {
     if (!isConnected) {
       throw new Error('Not connected to API. Please connect first.');
     }
@@ -169,28 +305,72 @@ export const ApiProvider = ({ children }) => {
       throw new Error('Please select a language');
     }
 
-    const endpoint = large ? '/transcribe_large' : '/transcribe';
-    const form = new FormData();
-    form.append('file', file);
+    // Determine whether to use async based on file size and mode
+    // Auto-use async for large files (>5MB) or when explicitly requested
+    const shouldUseAsync = useAsync !== null 
+      ? useAsync 
+      : (large && file.size > 5 * 1024 * 1024); // Auto-async for large mode files >5MB
+
+    if (shouldUseAsync) {
+      // Use async endpoint with polling
+      console.log('Using async transcription with polling...');
+      
+      // Submit job
+      const submitResponse = await submitAsyncJob(file, language, onProgress);
+      const jobId = submitResponse.job_id;
+      
+      console.log(`Job submitted: ${jobId}, estimated time: ${submitResponse.estimated_time}s`);
+      
+      // Update progress
+      if (onProgress) {
+        onProgress({
+          stage: 'processing',
+          progress: 5,
+          message: `Job submitted. Estimated time: ${Math.ceil(submitResponse.estimated_time / 60)} minutes`,
+          jobId: jobId,
+        });
+      }
+      
+      // Wait for completion
+      const result = await waitForJobCompletion(jobId, onProgress);
+      return result;
+    } else {
+      // Use synchronous endpoint
+      console.log('Using synchronous transcription...');
+      
+      const endpoint = large ? '/transcribe_large' : '/transcribe';
+      const form = new FormData();
+      form.append('file', file);
+      
+      const { data } = await instance.post(endpoint, form, {
+        params: { language },
+        headers: { 'Content-Type': 'multipart/form-data' },
+        onUploadProgress: (progressEvent) => {
+          const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+          console.log(`Upload progress: ${percentCompleted}%`);
+          if (onProgress) {
+            onProgress({ stage: 'uploading', progress: percentCompleted });
+          }
+        },
+        onDownloadProgress: (progressEvent) => {
+          // Response is being received - transcription is complete
+          if (onProgress) {
+            onProgress({ stage: 'receiving', progress: 100 });
+          }
+        },
+      });
+      
+      return data;
+    }
+  };
+
+  // Get job status (for manual checking)
+  const getJobStatus = async (jobId) => {
+    if (!isConnected) {
+      throw new Error('Not connected to API. Please connect first.');
+    }
     
-    const { data } = await instance.post(endpoint, form, {
-      params: { language },
-      headers: { 'Content-Type': 'multipart/form-data' },
-      onUploadProgress: (progressEvent) => {
-        const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
-        console.log(`Upload progress: ${percentCompleted}%`);
-        if (onProgress) {
-          onProgress({ stage: 'uploading', progress: percentCompleted });
-        }
-      },
-      onDownloadProgress: (progressEvent) => {
-        // Response is being received - transcription is complete
-        if (onProgress) {
-          onProgress({ stage: 'receiving', progress: 100 });
-        }
-      },
-    });
-    
+    const { data } = await instance.get(`/jobs/${jobId}`, { timeout: 10000 });
     return data;
   };
 
@@ -201,10 +381,13 @@ export const ApiProvider = ({ children }) => {
     languages,
     loading,
     error,
+    currentJobId,
     connect,
     disconnect,
     transcribe,
     validateFile,
+    cancelJob,
+    getJobStatus,
   };
 
   return (

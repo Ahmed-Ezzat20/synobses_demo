@@ -7,7 +7,7 @@ import ResultsCard from './components/ResultsCard.jsx';
 import { useApi } from './context/ApiContext.jsx';
 
 const App = () => {
-  const { isConnected, transcribe } = useApi();
+  const { isConnected, transcribe, cancelJob, currentJobId } = useApi();
   const [language, setLanguage] = useState('');
   const [largeMode, setLargeMode] = useState(false);
   const [file, setFile] = useState(null);
@@ -60,8 +60,10 @@ const App = () => {
       setError(`Audio duration is ${audioDuration.toFixed(1)}s. Please use Large File Mode for audio longer than 40 seconds.`);
       return;
     }
+    
     try {
       setLoading(true);
+      setResult(null);
       setProgressInfo({ stage: 'uploading', progress: 0 });
       
       // Estimate processing time
@@ -73,10 +75,20 @@ const App = () => {
         setEstimatedTime(estimate);
       }
       
+      // Determine if we should use async (for files > 2 minutes)
+      const useAsync = largeMode && audioDuration && audioDuration > 120;
+      
       const data = await transcribe(
-        { file, language, large: largeMode },
+        { file, language, large: largeMode, useAsync },
         (progress) => {
           setProgressInfo(progress);
+          // Update estimated time based on server response
+          if (progress.message && progress.message.includes('Estimated time')) {
+            const match = progress.message.match(/(\d+)\s*min/);
+            if (match) {
+              setEstimatedTime(parseInt(match[1]) * 60);
+            }
+          }
         }
       );
       
@@ -89,6 +101,73 @@ const App = () => {
       setLoading(false);
     }
   };
+
+  const handleCancel = () => {
+    cancelJob();
+    setLoading(false);
+    setProgressInfo({ stage: '', progress: 0 });
+    setError('Transcription cancelled.');
+  };
+
+  // Get progress stage display info
+  const getProgressStageInfo = () => {
+    const { stage, progress, message, status, jobId } = progressInfo;
+    
+    switch (stage) {
+      case 'uploading':
+        return {
+          icon: '📤',
+          title: 'Uploading audio file...',
+          showProgress: true,
+          progressValue: progress,
+          subtitle: `${progress}% uploaded`,
+        };
+      case 'processing':
+        return {
+          icon: '🤖',
+          title: status === 'pending' ? 'Job queued...' : 'Processing transcription...',
+          showProgress: true,
+          progressValue: progress || 0,
+          subtitle: message || 'AI model is analyzing your audio...',
+          isAnimated: true,
+          jobId: jobId,
+        };
+      case 'receiving':
+        return {
+          icon: '✅',
+          title: 'Transcription complete!',
+          showProgress: true,
+          progressValue: 100,
+          subtitle: 'Receiving results...',
+        };
+      case 'complete':
+        return {
+          icon: '🎉',
+          title: 'Done!',
+          showProgress: true,
+          progressValue: 100,
+          subtitle: 'Transcription completed successfully.',
+        };
+      case 'error':
+        return {
+          icon: '❌',
+          title: 'Error',
+          showProgress: false,
+          subtitle: 'Transcription failed.',
+        };
+      default:
+        return {
+          icon: '⏳',
+          title: 'Processing...',
+          showProgress: true,
+          progressValue: 0,
+          subtitle: 'Starting transcription...',
+          isAnimated: true,
+        };
+    }
+  };
+
+  const stageInfo = getProgressStageInfo();
 
   return (
     <div className="min-h-screen flex flex-col sm:flex-row font-sans">
@@ -103,83 +182,127 @@ const App = () => {
               <ModeToggler large={largeMode} onChange={setLargeMode} />
             </div>
             <FileUpload file={file} onFile={setFile} />
-            <button
-              onClick={handleTranscribe}
-              disabled={loading}
-              className="px-6 py-3 rounded bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 transition-all"
-            >
-              {loading ? 'Processing...' : 'Transcribe'}
-            </button>
+            
+            {/* Action Buttons */}
+            <div className="flex gap-4">
+              <button
+                onClick={handleTranscribe}
+                disabled={loading}
+                className="px-6 py-3 rounded bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 transition-all"
+              >
+                {loading ? 'Processing...' : 'Transcribe'}
+              </button>
+              
+              {loading && (
+                <button
+                  onClick={handleCancel}
+                  className="px-6 py-3 rounded bg-red-600 hover:bg-red-700 transition-all"
+                >
+                  Cancel
+                </button>
+              )}
+            </div>
             
             {/* Progress Indicator */}
             {loading && (
               <div className="bg-gray-800/50 border border-gray-700 rounded-lg p-6 space-y-4">
                 <div className="flex items-center justify-between">
-                  <h3 className="text-lg font-semibold text-white">
-                    {progressInfo.stage === 'uploading' && '📤 Uploading audio file...'}
-                    {progressInfo.stage === 'receiving' && '✅ Transcription complete, receiving results...'}
-                    {!progressInfo.stage && '⏳ Processing transcription...'}
+                  <h3 className="text-lg font-semibold text-white flex items-center gap-2">
+                    <span className={stageInfo.isAnimated ? 'animate-pulse' : ''}>
+                      {stageInfo.icon}
+                    </span>
+                    {stageInfo.title}
                   </h3>
-                  {progressInfo.stage === 'uploading' && (
+                  {stageInfo.showProgress && (
                     <span className="text-indigo-400 font-mono text-sm">
-                      {progressInfo.progress}%
+                      {stageInfo.progressValue}%
                     </span>
                   )}
                 </div>
                 
                 {/* Progress Bar */}
-                <div className="w-full bg-gray-700 rounded-full h-2 overflow-hidden">
-                  <div 
-                    className="h-full bg-gradient-to-r from-indigo-500 to-purple-500 transition-all duration-300 ease-out"
-                    style={{ 
-                      width: progressInfo.stage === 'uploading' 
-                        ? `${progressInfo.progress}%` 
-                        : '100%',
-                      animation: progressInfo.stage !== 'uploading' ? 'pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite' : 'none'
-                    }}
-                  />
-                </div>
+                {stageInfo.showProgress && (
+                  <div className="w-full bg-gray-700 rounded-full h-3 overflow-hidden">
+                    <div 
+                      className={`h-full transition-all duration-500 ease-out ${
+                        stageInfo.isAnimated 
+                          ? 'bg-gradient-to-r from-indigo-500 via-purple-500 to-indigo-500 bg-[length:200%_100%] animate-gradient'
+                          : 'bg-gradient-to-r from-indigo-500 to-purple-500'
+                      }`}
+                      style={{ 
+                        width: `${Math.max(stageInfo.progressValue, stageInfo.isAnimated ? 100 : 0)}%`,
+                      }}
+                    />
+                  </div>
+                )}
                 
                 {/* Status Messages */}
                 <div className="space-y-2 text-sm text-gray-400">
-                  {progressInfo.stage === 'uploading' && (
-                    <p>⏱️ Uploading your audio file to the server...</p>
+                  <p>{stageInfo.subtitle}</p>
+                  
+                  {/* Job ID for async jobs */}
+                  {stageInfo.jobId && (
+                    <p className="text-gray-500 font-mono text-xs">
+                      Job ID: {stageInfo.jobId}
+                    </p>
                   )}
-                  {progressInfo.stage === 'receiving' && (
-                    <p>📥 Receiving transcription results...</p>
+                  
+                  {/* Estimated time */}
+                  {progressInfo.stage === 'processing' && estimatedTime && (
+                    <p className="text-indigo-400">
+                      ⏱️ Estimated time remaining: ~{estimatedTime < 60 ? `${estimatedTime}s` : `${Math.ceil(estimatedTime / 60)} min`}
+                    </p>
                   )}
-                  {!progressInfo.stage && (
-                    <div className="space-y-1">
-                      <p>🤖 AI model is processing your audio...</p>
-                      {estimatedTime && (
-                        <p className="text-indigo-400">
-                          ⏱️ Estimated processing time: ~{estimatedTime < 60 ? `${estimatedTime}s` : `${Math.ceil(estimatedTime / 60)} min`}
-                        </p>
-                      )}
-                      {largeMode && (
-                        <p className="text-yellow-400">⚠️ Large File Mode: This may take several minutes depending on audio length.</p>
-                      )}
-                      <p className="text-gray-500 text-xs mt-2">
-                        💡 Tip: First request may take 6-7 minutes due to model loading. Subsequent requests are much faster (~30 seconds).
-                      </p>
+                  
+                  {/* Large file mode tips */}
+                  {largeMode && progressInfo.stage === 'processing' && (
+                    <div className="mt-3 p-3 bg-yellow-900/20 border border-yellow-700/50 rounded text-yellow-400 text-xs space-y-1">
+                      <p>💡 <strong>Large File Mode</strong>: Using async processing for reliability.</p>
+                      <p>📊 Progress updates every 3 seconds via polling.</p>
+                      <p>🔄 You can safely close this tab - check back with the Job ID.</p>
                     </div>
+                  )}
+                  
+                  {/* Cold start tip */}
+                  {progressInfo.stage === 'processing' && progressInfo.progress < 10 && (
+                    <p className="text-gray-500 text-xs mt-2">
+                      💡 First request may take 6-7 minutes due to model loading. Subsequent requests are much faster.
+                    </p>
                   )}
                 </div>
               </div>
             )}
+            
+            {/* Error Display */}
             {error && (
               <div className={`p-4 rounded ${
                 error.includes('Automatically switched') || error.includes('Please use Large File Mode') 
                   ? 'bg-yellow-900/30 border border-yellow-600 text-yellow-400' 
-                  : 'bg-red-900/30 border border-red-600 text-red-400'
+                  : error.includes('cancelled')
+                    ? 'bg-gray-800/50 border border-gray-600 text-gray-400'
+                    : 'bg-red-900/30 border border-red-600 text-red-400'
               }`}>
                 <p className="text-sm">{error}</p>
               </div>
             )}
+            
+            {/* Results */}
             {result && <ResultsCard data={result} />}
           </>
         )}
       </main>
+      
+      {/* Add gradient animation style */}
+      <style>{`
+        @keyframes gradient {
+          0% { background-position: 0% 50%; }
+          50% { background-position: 100% 50%; }
+          100% { background-position: 0% 50%; }
+        }
+        .animate-gradient {
+          animation: gradient 2s ease infinite;
+        }
+      `}</style>
     </div>
   );
 };

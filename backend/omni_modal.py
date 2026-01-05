@@ -1,6 +1,8 @@
 import modal
 import os
 import time
+import uuid
+from datetime import datetime, timedelta
 
 # Configure fairseq2 to use Modal's persistent volume for caching
 # This prevents re-downloading the 29.1GB model on every container restart
@@ -10,8 +12,9 @@ import json
 import hashlib
 import logging
 from typing import Optional, List, Dict, Any
+from enum import Enum
 from pydantic import BaseModel, Field, validator
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Form, Depends, Header, Request
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Form, Depends, Header, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -30,6 +33,9 @@ ALLOWED_MIME_TYPES = [
 ]
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 API_KEYS = set(os.getenv("API_KEYS", "").split(",")) if os.getenv("API_KEYS") else set()
+
+# Job expiration time (24 hours)
+JOB_EXPIRATION_HOURS = 24
 
 # Logging configuration
 logging.basicConfig(
@@ -60,10 +66,23 @@ image = (
 
 model_cache = modal.Volume.from_name("omniasr-cache", create_if_missing=True)
 
+# Job storage using Modal Dict for persistence across containers
+job_storage = modal.Dict.from_name("omniasr-jobs", create_if_missing=True)
+
 app = modal.App(
     "omniasr-llm-7b",
     image=image,
 )
+
+
+# --- Job Status Enum ---
+
+class JobStatus(str, Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
 
 # --- Request/Response Models ---
 
@@ -82,6 +101,23 @@ class TranscriptionResponse(BaseModel):
     segments_count: Optional[int] = Field(None, description="Number of segments")
     segments: Optional[List[Segment]] = Field(None, description="Detailed segments with timestamps")
     request_id: str = Field(..., description="Unique request identifier")
+
+
+class JobSubmitResponse(BaseModel):
+    job_id: str = Field(..., description="Unique job identifier for polling")
+    status: str = Field(..., description="Initial job status")
+    message: str = Field(..., description="Status message")
+    estimated_time: Optional[int] = Field(None, description="Estimated processing time in seconds")
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str = Field(..., description="Unique job identifier")
+    status: str = Field(..., description="Current job status: pending, processing, completed, failed")
+    progress: Optional[int] = Field(None, description="Progress percentage (0-100)")
+    message: Optional[str] = Field(None, description="Status message or error details")
+    created_at: str = Field(..., description="Job creation timestamp")
+    updated_at: str = Field(..., description="Last update timestamp")
+    result: Optional[TranscriptionResponse] = Field(None, description="Transcription result (when completed)")
 
 
 class LanguageResponse(BaseModel):
@@ -171,6 +207,66 @@ def generate_request_id(content: bytes) -> str:
     content_hash = hashlib.sha256(content).hexdigest()[:16]
     timestamp = str(int(time.time() * 1000))[-8:]
     return f"{content_hash}-{timestamp}"
+
+
+def generate_job_id() -> str:
+    """Generate unique job ID"""
+    return f"job-{uuid.uuid4().hex[:12]}"
+
+
+# --- Job Management Functions ---
+
+
+def create_job(job_id: str, filename: str, language: str, file_size: int) -> Dict[str, Any]:
+    """Create a new job entry"""
+    now = datetime.utcnow().isoformat()
+    job_data = {
+        "job_id": job_id,
+        "status": JobStatus.PENDING.value,
+        "progress": 0,
+        "message": "Job queued for processing",
+        "filename": filename,
+        "language": language,
+        "file_size": file_size,
+        "created_at": now,
+        "updated_at": now,
+        "result": None,
+        "error": None,
+    }
+    job_storage[job_id] = job_data
+    logger.info(f"[{job_id}] Job created for {filename}")
+    return job_data
+
+
+def update_job_status(job_id: str, status: JobStatus, progress: int = None, 
+                      message: str = None, result: Dict = None, error: str = None):
+    """Update job status"""
+    try:
+        job_data = job_storage.get(job_id)
+        if job_data:
+            job_data["status"] = status.value
+            job_data["updated_at"] = datetime.utcnow().isoformat()
+            if progress is not None:
+                job_data["progress"] = progress
+            if message is not None:
+                job_data["message"] = message
+            if result is not None:
+                job_data["result"] = result
+            if error is not None:
+                job_data["error"] = error
+            job_storage[job_id] = job_data
+            logger.info(f"[{job_id}] Status updated to {status.value}")
+    except Exception as e:
+        logger.error(f"[{job_id}] Failed to update job status: {e}")
+
+
+def get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    """Get job data by ID"""
+    try:
+        return job_storage.get(job_id)
+    except Exception as e:
+        logger.error(f"[{job_id}] Failed to get job: {e}")
+        return None
 
 
 # --- Model & Logic ---
@@ -360,13 +456,20 @@ class OmniASRModel:
 
     @modal.method()
     def transcribe_large(
-        self, audio_bytes: bytes, filename: str, language: str, request_id: str
+        self, audio_bytes: bytes, filename: str, language: str, request_id: str,
+        job_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """Split audio using Silero VAD and transcribe chunks with timestamps"""
         import soundfile as sf
         import torch
+        import librosa
 
         logger.info(f"[{request_id}] Starting large file transcription for {filename}")
+        
+        # Update job status if job_id provided
+        if job_id:
+            update_job_status(job_id, JobStatus.PROCESSING, progress=5, 
+                            message="Reading audio file...")
         
         suffix = os.path.splitext(filename)[1]
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as main_tmp:
@@ -380,8 +483,13 @@ class OmniASRModel:
             # Read audio for VAD
             try:
                 wav = self.read_audio(main_path, sampling_rate=16000)
+                if job_id:
+                    update_job_status(job_id, JobStatus.PROCESSING, progress=10,
+                                    message="Detecting speech segments...")
             except Exception as e:
                 logger.error(f"[{request_id}] Error reading audio: {e}")
+                if job_id:
+                    update_job_status(job_id, JobStatus.FAILED, error=f"Invalid audio file: {str(e)}")
                 raise HTTPException(
                     status_code=400,
                     detail=f"Invalid audio file: {str(e)}"
@@ -399,12 +507,17 @@ class OmniASRModel:
             )
 
             logger.info(f"[{request_id}] Found {len(speech_timestamps)} speech segments")
+            
+            if job_id:
+                update_job_status(job_id, JobStatus.PROCESSING, progress=20,
+                                message=f"Found {len(speech_timestamps)} speech segments")
 
             if not speech_timestamps:
                 logger.warning(f"[{request_id}] No speech detected, processing entire audio")
                 # Process the entire audio without VAD chunking
-                # Skip the duration check since we're in large file mode
-                import librosa
+                if job_id:
+                    update_job_status(job_id, JobStatus.PROCESSING, progress=30,
+                                    message="No speech segments detected, processing entire audio...")
                 
                 with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as tmp:
                     tmp.write(audio_bytes)
@@ -414,29 +527,45 @@ class OmniASRModel:
                     duration = librosa.get_duration(path=tmp_path)
                     logger.info(f"[{request_id}] Processing entire audio: {duration:.2f}s")
                     
-                    result = self.model.transcribe(tmp_path, language=language)
-                    transcription = result["text"].strip()
+                    # Use pipeline directly for transcription
+                    start_time = time.time()
+                    transcriptions = self.pipeline.transcribe(
+                        [tmp_path],
+                        lang=[language],
+                    )
+                    processing_time = time.time() - start_time
+                    transcription = transcriptions[0].strip()
                     
                     segments = [{
                         "start": 0.0,
-                        "end": duration,
+                        "end": round(duration, 2),
                         "text": transcription
                     }]
                     
-                    return {
+                    result = {
                         "transcription": transcription,
                         "language": language,
-                        "processing_time": 0.0,
-                        "audio_duration": duration,
+                        "processing_time": round(processing_time, 3),
+                        "audio_duration": round(duration, 2),
                         "segments_count": 1,
                         "segments": segments,
                         "request_id": request_id
                     }
+                    
+                    if job_id:
+                        update_job_status(job_id, JobStatus.COMPLETED, progress=100,
+                                        message="Transcription completed", result=result)
+                    
+                    return result
                 finally:
                     if os.path.exists(tmp_path):
                         os.remove(tmp_path)
 
             data, samplerate = sf.read(main_path)
+            
+            if job_id:
+                update_job_status(job_id, JobStatus.PROCESSING, progress=25,
+                                message="Preparing audio segments...")
 
             for i, ts in enumerate(speech_timestamps):
                 # Calculate times
@@ -455,6 +584,10 @@ class OmniASRModel:
                     chunk_paths.append(c_tmp.name)
                     chunk_metadata.append({"start": start_sec, "end": end_sec})
 
+            if job_id:
+                update_job_status(job_id, JobStatus.PROCESSING, progress=30,
+                                message=f"Transcribing {len(chunk_paths)} segments...")
+
             # Transcribe all chunks
             start_time = time.time()
             try:
@@ -463,8 +596,14 @@ class OmniASRModel:
                 )
                 processing_time = time.time() - start_time
                 logger.info(f"[{request_id}] Batch transcription completed in {processing_time:.2f}s")
+                
+                if job_id:
+                    update_job_status(job_id, JobStatus.PROCESSING, progress=90,
+                                    message="Finalizing transcription...")
             except Exception as e:
                 logger.error(f"[{request_id}] Batch transcription error: {e}")
+                if job_id:
+                    update_job_status(job_id, JobStatus.FAILED, error=f"Transcription failed: {str(e)}")
                 raise HTTPException(
                     status_code=500,
                     detail=f"Transcription failed: {str(e)}"
@@ -491,7 +630,7 @@ class OmniASRModel:
 
             logger.info(f"[{request_id}] Generated {len(detailed_segments)} segments")
 
-            return {
+            result = {
                 "transcription": full_transcription,
                 "language": language,
                 "processing_time": round(processing_time, 3),
@@ -500,6 +639,12 @@ class OmniASRModel:
                 "segments": detailed_segments,
                 "request_id": request_id,
             }
+            
+            if job_id:
+                update_job_status(job_id, JobStatus.COMPLETED, progress=100,
+                                message="Transcription completed", result=result)
+            
+            return result
 
         finally:
             if os.path.exists(main_path):
@@ -509,12 +654,42 @@ class OmniASRModel:
                     os.unlink(p)
 
 
+# --- Background Task Function ---
+
+
+@app.function(
+    timeout=3600,
+    volumes={MODEL_DIR: model_cache},
+)
+def process_transcription_job(job_id: str, audio_bytes: bytes, filename: str, language: str):
+    """Background function to process transcription jobs"""
+    request_id = f"async-{job_id}"
+    logger.info(f"[{job_id}] Starting background transcription job")
+    
+    try:
+        update_job_status(job_id, JobStatus.PROCESSING, progress=5,
+                         message="Initializing transcription...")
+        
+        model = OmniASRModel()
+        result = model.transcribe_large.remote(
+            audio_bytes, filename, language, request_id, job_id
+        )
+        
+        # Result is already saved by transcribe_large when job_id is provided
+        logger.info(f"[{job_id}] Background job completed successfully")
+        
+    except Exception as e:
+        logger.error(f"[{job_id}] Background job failed: {e}")
+        update_job_status(job_id, JobStatus.FAILED, 
+                         error=str(e), message=f"Transcription failed: {str(e)}")
+
+
 # --- FastAPI App ---
 
 web_app = FastAPI(
     title="OmniASR API",
-    version="2.3.0",
-    description="Multilingual Automatic Speech Recognition API with intelligent audio processing",
+    version="2.4.0",
+    description="Multilingual Automatic Speech Recognition API with intelligent audio processing and async job support",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -602,7 +777,7 @@ async def health(request: Request):
         "status": "healthy",
         "service": "OmniASR",
         "timestamp": time.time(),
-        "version": "2.3.0"
+        "version": "2.4.0"
     }
 
 
@@ -702,8 +877,8 @@ async def transcribe(
 @web_app.post(
     "/transcribe_large",
     response_model=TranscriptionResponse,
-    tags=["4. Transcribe Large"],
-    summary="Transcribe long audio files",
+    tags=["4. Transcribe Large (Sync)"],
+    summary="Transcribe long audio files (synchronous)",
     dependencies=[Depends(verify_api_key)]
 )
 @limiter.limit("10/minute")
@@ -715,7 +890,8 @@ async def transcribe_large_file(
     """
     Transcribe long audio files using intelligent Voice Activity Detection (VAD).
     
-    Automatically segments audio into speech chunks and provides detailed timestamps.
+    **Note**: For very long files (>5 minutes), consider using /transcribe_async instead
+    to avoid timeout issues.
     
     - **file**: Audio file (MP3, WAV, MP4, WebM, OGG)
     - **language**: Language code from /languages endpoint
@@ -751,6 +927,142 @@ async def transcribe_large_file(
     except Exception as e:
         logger.error(f"[{request_id}] Large file transcription failed: {e}")
         raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+
+
+# --- Async Job Endpoints ---
+
+
+@web_app.post(
+    "/transcribe_async",
+    response_model=JobSubmitResponse,
+    tags=["5. Transcribe Async (Recommended)"],
+    summary="Submit long audio for async transcription",
+    dependencies=[Depends(verify_api_key)]
+)
+@limiter.limit("10/minute")
+async def transcribe_async(
+    request: Request,
+    file: UploadFile = File(..., description="Audio file to transcribe"),
+    language: str = Query(..., description="Target language code (e.g., 'eng_Latn', 'arb_Arab')"),
+):
+    """
+    Submit a long audio file for asynchronous transcription.
+    
+    **Recommended for files longer than 2 minutes** to avoid timeout issues.
+    
+    Returns a job_id immediately. Use /jobs/{job_id} to poll for status and results.
+    
+    - **file**: Audio file (MP3, WAV, MP4, WebM, OGG)
+    - **language**: Language code from /languages endpoint
+    
+    Returns job_id for polling.
+    """
+    content = await file.read()
+    
+    # Validate file size
+    validate_file_size(len(content))
+    
+    # Validate file type
+    validate_file_type(content, file.filename or "audio")
+    
+    # Validate language
+    model = OmniASRModel()
+    is_valid = model.validate_language.remote(language)
+    if not is_valid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported language: {language}. Use /languages endpoint to get supported languages."
+        )
+    
+    # Generate job ID and create job
+    job_id = generate_job_id()
+    filename = file.filename or "audio.wav"
+    
+    # Create job entry
+    create_job(job_id, filename, language, len(content))
+    
+    # Estimate processing time (rough estimate: 3x real-time for transcription)
+    # Assuming ~16kbps for audio, estimate duration
+    estimated_duration = len(content) / (16000 * 2)  # Rough estimate
+    estimated_time = int(estimated_duration * 3) + 60  # 3x real-time + 60s buffer
+    
+    # Spawn background task
+    process_transcription_job.spawn(job_id, content, filename, language)
+    
+    logger.info(f"[{job_id}] Async job submitted for {filename}")
+    
+    return {
+        "job_id": job_id,
+        "status": "pending",
+        "message": "Job submitted successfully. Poll /jobs/{job_id} for status.",
+        "estimated_time": estimated_time,
+    }
+
+
+@web_app.get(
+    "/jobs/{job_id}",
+    response_model=JobStatusResponse,
+    tags=["5. Transcribe Async (Recommended)"],
+    summary="Get job status and results",
+    dependencies=[Depends(verify_api_key)]
+)
+@limiter.limit("60/minute")
+async def get_job_status(
+    request: Request,
+    job_id: str,
+):
+    """
+    Get the status and results of an async transcription job.
+    
+    Poll this endpoint every 3-5 seconds until status is 'completed' or 'failed'.
+    
+    - **job_id**: The job ID returned from /transcribe_async
+    
+    Returns current status, progress, and results when completed.
+    """
+    job_data = get_job(job_id)
+    
+    if not job_data:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Job not found: {job_id}"
+        )
+    
+    response = {
+        "job_id": job_data["job_id"],
+        "status": job_data["status"],
+        "progress": job_data.get("progress", 0),
+        "message": job_data.get("message") or job_data.get("error"),
+        "created_at": job_data["created_at"],
+        "updated_at": job_data["updated_at"],
+        "result": job_data.get("result"),
+    }
+    
+    return response
+
+
+@web_app.get(
+    "/jobs",
+    tags=["5. Transcribe Async (Recommended)"],
+    summary="List recent jobs",
+    dependencies=[Depends(verify_api_key)]
+)
+@limiter.limit("10/minute")
+async def list_jobs(
+    request: Request,
+    limit: int = Query(10, ge=1, le=50, description="Maximum number of jobs to return"),
+):
+    """
+    List recent transcription jobs.
+    
+    Returns up to the specified limit of most recent jobs.
+    """
+    # Note: Modal Dict doesn't support listing all keys efficiently
+    # This is a simplified implementation
+    return {
+        "message": "Use /jobs/{job_id} to check specific job status",
+        "note": "Job listing is not fully supported. Store your job_ids client-side."
+    }
 
 
 @app.function(
