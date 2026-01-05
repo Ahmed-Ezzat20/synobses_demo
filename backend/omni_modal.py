@@ -401,8 +401,38 @@ class OmniASRModel:
             logger.info(f"[{request_id}] Found {len(speech_timestamps)} speech segments")
 
             if not speech_timestamps:
-                logger.warning(f"[{request_id}] No speech detected, falling back to standard transcription")
-                return self.transcribe.local(audio_bytes, filename, language, request_id)
+                logger.warning(f"[{request_id}] No speech detected, processing entire audio")
+                # Process the entire audio without VAD chunking
+                # Skip the duration check since we're in large file mode
+                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as tmp:
+                    tmp.write(audio_bytes)
+                    tmp_path = tmp.name
+                
+                try:
+                    duration = librosa.get_duration(path=tmp_path)
+                    logger.info(f"[{request_id}] Processing entire audio: {duration:.2f}s")
+                    
+                    result = self.model.transcribe(tmp_path, language=language)
+                    transcription = result["text"].strip()
+                    
+                    segments = [{
+                        "start": 0.0,
+                        "end": duration,
+                        "text": transcription
+                    }]
+                    
+                    return {
+                        "transcription": transcription,
+                        "language": language,
+                        "processing_time": 0.0,
+                        "audio_duration": duration,
+                        "segments_count": 1,
+                        "segments": segments,
+                        "request_id": request_id
+                    }
+                finally:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
 
             data, samplerate = sf.read(main_path)
 
