@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import Sidebar from './components/Sidebar.jsx';
+import { Upload, Loader2, CheckCircle2, XCircle } from 'lucide-react';
 import LanguageSelector from './components/LanguageSelector.jsx';
 import ModeToggler from './components/ModeToggler.jsx';
 import FileUpload from './components/FileUpload.jsx';
@@ -116,7 +117,7 @@ const App = () => {
     switch (stage) {
       case 'uploading':
         return {
-          icon: '📤',
+          icon: <Upload className="w-5 h-5 text-indigo-400" />,
           title: 'Uploading audio file...',
           showProgress: true,
           progressValue: progress,
@@ -124,7 +125,7 @@ const App = () => {
         };
       case 'processing':
         return {
-          icon: '🤖',
+          icon: <Loader2 className="w-5 h-5 animate-spin text-indigo-400" />,
           title: status === 'pending' ? 'Job queued...' : 'Processing transcription...',
           showProgress: true,
           progressValue: progress || 0,
@@ -134,7 +135,7 @@ const App = () => {
         };
       case 'receiving':
         return {
-          icon: '✅',
+          icon: <CheckCircle2 className="w-5 h-5 text-green-400" />,
           title: 'Transcription complete!',
           showProgress: true,
           progressValue: 100,
@@ -142,7 +143,7 @@ const App = () => {
         };
       case 'complete':
         return {
-          icon: '🎉',
+          icon: <CheckCircle2 className="w-5 h-5 text-green-400" />,
           title: 'Done!',
           showProgress: true,
           progressValue: 100,
@@ -150,14 +151,14 @@ const App = () => {
         };
       case 'error':
         return {
-          icon: '❌',
+          icon: <XCircle className="w-5 h-5 text-red-400" />,
           title: 'Error',
           showProgress: false,
           subtitle: 'Transcription failed.',
         };
       default:
         return {
-          icon: '⏳',
+          icon: <Loader2 className="w-5 h-5 animate-spin text-indigo-400" />,
           title: 'Processing...',
           showProgress: true,
           progressValue: 0,
@@ -205,10 +206,10 @@ const App = () => {
             
             {/* Progress Indicator */}
             {loading && (
-              <div className="bg-gray-800/50 border border-gray-700 rounded-lg p-6 space-y-4">
+              <div className="bg-gray-800/30 backdrop-blur-sm border border-gray-600/60 rounded-lg p-6 space-y-4">
                 <div className="flex items-center justify-between">
                   <h3 className="text-lg font-semibold text-white flex items-center gap-2">
-                    <span className={stageInfo.isAnimated ? 'animate-pulse' : ''}>
+                    <span className={stageInfo.isAnimated ? 'opacity-80 animate-spin-slow' : ''}>
                       {stageInfo.icon}
                     </span>
                     {stageInfo.title}
